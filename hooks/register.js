@@ -1,4 +1,5 @@
-// cache-ttl-timer: a prompt-cache countdown beside the mode labels in the prompt footer.
+// cache-ttl-timer: a prompt-cache countdown beside the mode labels in the terminal's prompt
+// footer, and in the band above the prompt on the desktop.
 //
 // The main conversation's cache entry lives for its TTL after the last request
 // that used it. The countdown starts when each main-loop request is sent
@@ -37,8 +38,6 @@ const RING_COLOR = { warm: '#9a9a9a', warn: '#d99a2b' }
 let override = null
 // What the indicator last drew, so the ticker redraws only when the label or the ring changes
 let drawnKey = ''
-// Whether the desktop has asked for the footer's mode labels; until it does, the band above the prompt stands in
-let desktopFooterSeen = false
 
 export function register(on) {
   // Runs before the first prompt, and again after a reload
@@ -100,19 +99,17 @@ export function register(on) {
     return { text: await statusText($) }
   })
 
-  // Runs each time Claude Code draws the mode labels in the prompt footer
+  // Runs each time Claude Code draws the mode labels in the prompt footer. Only the terminal's
+  // footer holds them beside the model and effort: the desktop app lays the model and effort out
+  // in a row under the prompt and draws these labels on a row of their own beneath it.
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
-    if (e.surface === 'desktop' && !desktopFooterSeen) {
-      desktopFooterSeen = true
-      // Take the stand-in above the prompt down
-      $.ui.invalidate('ui.render')
-    }
+    if (e.surface !== 'terminal') return next(e)
     const now = await readout($)
     if (!now) return next(e)
-    const indicator = await drawIndicator($, e, now)
+    const { Box, Text } = $.ui.resolve(e)
+    const indicator = Text({ ...LABEL_STYLE[now.level], children: [ringGlyph(now) + ' ' + now.label] })
     if (e.props.modes.length === 0) return indicator
     // Keep Claude Code's labels, with the indicator after them
-    const { Box, Text } = $.ui.resolve(e)
     const theirs = await next(e)
     return Box({
       flexDirection: 'row',
@@ -121,33 +118,22 @@ export function register(on) {
     })
   })
 
-  // Runs each time Claude Code draws the band above the prompt. A desktop that never asks for
-  // the footer's mode labels gets the indicator here instead, at the right, above the context ring.
+  // Runs each time Claude Code draws the band above the prompt: the desktop's indicator, at the
+  // right, with its ring an SVG the size of the context ring
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.surface !== 'desktop' || desktopFooterSeen || e.props.hasSurvey) return next(e)
+    if (e.surface !== 'desktop' || e.props.hasSurvey) return next(e)
     const now = await readout($)
     if (!now) return next(e)
-    const { Box } = $.ui.resolve(e)
+    const { Box, Text, Svg } = $.ui.resolve(e)
+    const ring = Svg({ source: ringSvg(now), alt: 'Prompt cache: ' + now.label, width: 14, height: 14 })
+    const label = Text({ ...LABEL_STYLE[now.level], children: [now.label] })
     return Box({
       flexDirection: 'row',
       justifyContent: 'flex-end',
       width: e.props.bodyColumns,
-      children: [await drawIndicator($, e, now)],
+      children: [Box({ flexDirection: 'row', alignItems: 'center', columnGap: 1, children: [ring, label] })],
     })
   })
-}
-
-// The indicator itself: a ring and its label. The footer draws text alone on every surface (the
-// desktop drops images there), so its ring is a glyph; the desktop's band above the prompt draws
-// images, so there the ring is an SVG the size of the context ring.
-async function drawIndicator($, e, now) {
-  const { Box, Text, Svg } = $.ui.resolve(e)
-  if (e.surface === 'desktop' && e.component === 'AbovePrompt') {
-    const ring = Svg({ source: ringSvg(now), alt: 'Prompt cache: ' + now.label, width: 14, height: 14 })
-    const label = Text({ ...LABEL_STYLE[now.level], children: [now.label] })
-    return Box({ flexDirection: 'row', alignItems: 'center', columnGap: 1, children: [ring, label] })
-  }
-  return Text({ ...LABEL_STYLE[now.level], children: [ringGlyph(now) + ' ' + now.label] })
 }
 
 // Where the countdown stands now, or null before the first request

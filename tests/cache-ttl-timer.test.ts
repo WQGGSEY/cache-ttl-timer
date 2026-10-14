@@ -70,8 +70,18 @@ async function labelText(ui: any) {
   return t ? String(t.text).replace(/^[●◕◑◔○◌] /, '') : undefined
 }
 
-function band($: any, surface: 'desktop' | 'terminal') {
-  return $.ui.mount({ plugin: 'cache-ttl-timer', surface, component: 'AbovePrompt', props: BAND })
+function band($: any, surface: 'desktop' | 'terminal', props: Record<string, unknown> = {}) {
+  return $.ui.mount({ plugin: 'cache-ttl-timer', surface, component: 'AbovePrompt', props: { ...BAND, ...props } })
+}
+
+// Where each surface draws the indicator: the terminal's footer, the desktop's band above the prompt
+function indicator($: any, surface: 'desktop' | 'terminal') {
+  return surface === 'terminal' ? footer($, surface) : band($, surface)
+}
+
+// /cache-ttl as typed at the prompt
+function cacheTtl($: any, args: string) {
+  return $.command.run({ command: 'cache-ttl', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } })
 }
 
 describe('cache-ttl-timer', () => {
@@ -79,36 +89,36 @@ describe('cache-ttl-timer', () => {
     world(on)
     await start($)
     for (const surface of SURFACES) {
-      const ui = await footer($, surface)
+      const ui = await indicator($, surface)
       expect(await label(ui)).toBeUndefined()
       await ui.unmount()
     }
   })
 
   // Moving the clock an hour runs the once-a-second ticker 3,600 times
-  test('the footer shows a glyph ring and the time: gray, then the warning color in the last fifth, then cold', { timeoutMs: 60_000 }, async ($, on) => {
+  test('shows the ring and the time: gray, then the warning color in the last fifth, then cold', { timeoutMs: 60_000 }, async ($, on) => {
     const clock = world(on)
     await start($)
     await step($)
-    const expectEach = async (text: string, style: Record<string, unknown>) => {
+    const expectEach = async (glyph: string, text: string, style: Record<string, unknown>) => {
       for (const surface of SURFACES) {
-        const ui = await footer($, surface)
+        const ui = await indicator($, surface)
         const t = await label(ui)
-        expect(t?.text).toBe(text)
+        // The terminal's ring is a glyph before the time; the desktop's is an SVG beside it
+        expect(t?.text).toBe(surface === 'terminal' ? glyph + ' ' + text : text)
         expect(t?.props).toEqual(expect.objectContaining(style))
-        // The footer is text alone: the desktop draws no image there
-        expect(await ui.find({ type: 'Svg' })).toBeUndefined()
+        expect(Boolean(await ui.find({ type: 'Svg' }))).toBe(surface === 'desktop')
         await ui.unmount()
       }
     }
     await clock.advance(1000)
-    await expectEach('● 60m', { dimColor: true })
+    await expectEach('●', '60m', { dimColor: true })
     await clock.set(START + 50 * MIN)
-    await expectEach('◔ 10m', { color: 'warning' })
+    await expectEach('◔', '10m', { color: 'warning' })
     await clock.set(START + 59 * MIN + 18_000)
-    await expectEach('○ 0:42', { color: 'warning' })
+    await expectEach('○', '0:42', { color: 'warning' })
     await clock.set(START + 60 * MIN + 1000)
-    await expectEach('◌ Cold', { dimColor: true })
+    await expectEach('◌', 'Cold', { dimColor: true })
   })
 
   test("the desktop's band draws the ring as an SVG image, amber in the last fifth, dashed with no arc once cold", async ($, on) => {
@@ -132,20 +142,35 @@ describe('cache-ttl-timer', () => {
     expect(cold).toContain('stroke-dasharray="1.6 2.1"')
   })
 
-  test('keeps the footer labels when there are some, and stands alone when there are none', async ($, on) => {
+  test("the terminal's footer keeps its labels when there are some, and the indicator stands alone when there are none", async ($, on) => {
     world(on)
     await start($)
     await step($)
-    for (const surface of SURFACES) {
-      const withModes = await footer($, surface, ['focus'])
-      expect(await labelText(withModes)).toBe('60m')
-      expect(await withModes.find({ type: 'Text', text: /^ · $/ })).toBeDefined()
-      await withModes.unmount()
-      const alone = await footer($, surface, [])
-      expect(await labelText(alone)).toBe('60m')
-      expect(await alone.find({ type: 'Text', text: /^ · $/ })).toBeUndefined()
-      await alone.unmount()
-    }
+    const withModes = await footer($, 'terminal', ['focus'])
+    expect(await labelText(withModes)).toBe('60m')
+    expect(await withModes.find({ type: 'Text', text: /^ · $/ })).toBeDefined()
+    await withModes.unmount()
+    const alone = await footer($, 'terminal', [])
+    expect(await labelText(alone)).toBe('60m')
+    expect(await alone.find({ type: 'Text', text: /^ · $/ })).toBeUndefined()
+  })
+
+  test("the desktop draws the indicator above the prompt, at the right, and leaves the footer's labels to Claude Code", async ($, on) => {
+    world(on)
+    await start($)
+    await step($)
+    const desktopBand = await band($, 'desktop')
+    expect(await labelText(desktopBand)).toBe('60m')
+    expect((await desktopBand.find({ type: 'Box' }))?.props.justifyContent).toBe('flex-end')
+    // The desktop draws the footer's labels on a row of their own under the model and effort
+    const desktopFooter = await footer($, 'desktop', [])
+    expect(await label(desktopFooter)).toBeUndefined()
+    // The terminal's band stays Claude Code's: its indicator is in the footer
+    const terminalBand = await band($, 'terminal')
+    expect(await label(terminalBand)).toBeUndefined()
+    // A survey holds the band
+    const surveyBand = await band($, 'desktop', { hasSurvey: true })
+    expect(await label(surveyBand)).toBeUndefined()
   })
 
   test("a subagent's request doesn't restart the countdown", async ($, on) => {
@@ -154,7 +179,7 @@ describe('cache-ttl-timer', () => {
     await step($)
     await clock.advance(30 * MIN)
     await step($, 'agent-1')
-    const ui = await footer($, 'desktop')
+    const ui = await band($, 'desktop')
     expect(await labelText(ui)).toBe('30m')
     await step($)
     await clock.settle()
@@ -179,10 +204,10 @@ describe('cache-ttl-timer', () => {
     world(on, transcript)
     await start($)
     await $.classic.Stop({ stop_hook_active: false, transcript_path: '/t.jsonl' })
-    const ui = await footer($, 'desktop')
+    const ui = await band($, 'desktop')
     // The countdown starts when the request was sent, the prompt row's time, not the answer's
     expect(await labelText(ui)).toBe('5m')
-    const reply = await $.command.run({ command: 'cache-ttl', args: '' })
+    const reply = await cacheTtl($, '')
     expect(reply.text).toContain('TTL 5m (from the transcript)')
     expect(reply.text).toContain('drawn on desktop')
   })
@@ -191,30 +216,13 @@ describe('cache-ttl-timer', () => {
     world(on)
     await start($)
     await step($)
-    const ui = await footer($, 'desktop')
-    await $.command.run({ command: 'cache-ttl', args: '5m' })
+    const ui = await band($, 'desktop')
+    await cacheTtl($, '5m')
     expect(await labelText(ui)).toBe('5m')
-    await $.command.run({ command: 'cache-ttl', args: 'auto' })
+    await cacheTtl($, 'auto')
     expect(await labelText(ui)).toBe('60m')
-    const bad = await $.command.run({ command: 'cache-ttl', args: '2h' })
+    const bad = await cacheTtl($, '2h')
     expect(bad.text).toContain('Use /cache-ttl')
-  })
-
-  test('a desktop that never asks for the footer gets the indicator above the prompt, at the right', async ($, on) => {
-    world(on)
-    await start($)
-    await step($)
-    const desktopBand = await band($, 'desktop')
-    expect(await labelText(desktopBand)).toBe('60m')
-    expect((await desktopBand.find({ type: 'Box' }))?.props.justifyContent).toBe('flex-end')
-    // The terminal always draws the footer, so its band stays Claude Code's
-    const terminalBand = await band($, 'terminal')
-    expect(await label(terminalBand)).toBeUndefined()
-    // Once the desktop asks for the footer, the indicator moves there and the band empties
-    const foot = await footer($, 'desktop', [])
-    await desktopBand.redraw()
-    expect(await label(desktopBand)).toBeUndefined()
-    expect(await labelText(foot)).toBe('60m')
   })
 
   test('without `tail` (Windows) the countdown still runs, on the default TTL, and no hook fails', async ($, on) => {
@@ -224,7 +232,7 @@ describe('cache-ttl-timer', () => {
     await step($)
     const ui = await footer($, 'terminal')
     expect((await label(ui))?.text).toBe('● 60m')
-    const reply = await $.command.run({ command: 'cache-ttl', args: '' })
+    const reply = await cacheTtl($, '')
     expect(reply.text).toContain('TTL 1h (default)')
   })
 })

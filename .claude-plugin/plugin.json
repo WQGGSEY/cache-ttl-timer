@@ -1,8 +1,8 @@
 {
   "name": "cache-ttl-timer",
   "displayName": "Cache TTL Timer",
-  "version": "1.0.0",
-  "description": "A prompt-cache countdown in the prompt footer, beside the model and effort: how long until your next message has to re-cache the whole conversation.",
+  "version": "1.1.0",
+  "description": "A prompt-cache countdown beside the prompt, in the terminal footer and above the prompt on the desktop: how long until your next message has to re-cache the whole conversation.",
   "author": {
     "name": "Seongje Hong",
     "url": "https://github.com/WQGGSEY"
