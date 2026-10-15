@@ -1,5 +1,6 @@
 // cache-ttl-timer: a prompt-cache countdown beside the mode labels in the terminal's prompt
-// footer, and in the band above the prompt on the desktop.
+// footer, and in the band above the prompt on the desktop, where a button also turns the
+// engine's idle compaction off or on for the session.
 //
 // The main conversation's cache entry lives for its TTL after the last request
 // that used it. The countdown starts when each main-loop request is sent
@@ -11,6 +12,12 @@ import { atom, read, update } from 'claude-code'
 const lastHit = atom({ plugin: 'cache-ttl-timer', key: 'lastHit' }, null)
 // The TTL the latest cache write used, as the transcript reports it; null until one is seen
 const detectedTtl = atom({ plugin: 'cache-ttl-timer', key: 'detectedTtl' }, null)
+// Whether a model turn of the main conversation is running
+const turnActive = atom({ plugin: 'cache-ttl-timer', key: 'turnActive' }, false)
+// When the person last sent a prompt, in $.clock.now() milliseconds; null before any
+const promptAt = atom({ plugin: 'cache-ttl-timer', key: 'promptAt' }, null)
+// Whether this session refuses the engine's idle compaction, from the band's button
+const idleCompactionOff = atom({ plugin: 'cache-ttl-timer', key: 'idleCompactionOff' }, false)
 
 const TTL_MS = { '5m': 5 * 60 * 1000, '1h': 60 * 60 * 1000 }
 // What Claude Code asks for on the main thread of a subscription that isn't in overage
@@ -31,6 +38,12 @@ const GLYPHS = ['●', '◕', '◑', '◔', '○']
 const COLD_GLYPH = '◌'
 // Label colors by level: the footer's own dim gray, the theme's warning, and dim again once cold
 const LABEL_STYLE = { warm: { dimColor: true }, warn: { color: 'warning' }, cold: { dimColor: true } }
+// The band's label: the text color while warm, the warning in the last fifth, dim once cold
+const BAND_LABEL_STYLE = { warm: {}, warn: { color: 'warning' }, cold: { dimColor: true } }
+// A prompt sent this recently opens a turn whose turn.start may not have arrived yet
+const PROMPT_GRACE_MS = 2 * 60 * 1000
+// What the transcript says when this session skips an idle compaction
+const IDLE_SKIP = 'Idle compaction is off for this session'
 // The desktop ring's arc by level
 const RING_COLOR = { warm: '#9a9a9a', warn: '#d99a2b' }
 
@@ -49,6 +62,9 @@ export function register(on) {
     })
     const saved = await $.store.get('override')
     override = saved === '5m' || saved === '1h' ? saved : null
+    // This session's idle compaction choice, kept across a resume
+    const off = (await $.store.get(idleKey(await $.session.id()))) === true
+    await update($, idleCompactionOff, () => off)
     // After a reload or a resume, pick the countdown up from the transcript
     try {
       const path = await transcriptPath($)
@@ -70,6 +86,33 @@ export function register(on) {
   on('classic.Stop', async ($, e, next) => {
     await learnFromTranscript($, e.transcript_path)
     return next(e)
+  })
+
+  // Runs when the person sends a prompt, before the turn it opens
+  on('prompt.submit', async ($, e, next) => {
+    const at = await $.clock.now()
+    await update($, promptAt, () => at)
+    return next(e)
+  })
+
+  // Runs when a turn of the main conversation begins and ends
+  on('turn.start', async ($, e, next) => {
+    await update($, turnActive, () => true)
+    return next(e)
+  })
+  on('turn.complete', async ($, e, next) => {
+    if (!e.agentId) await update($, turnActive, () => false)
+    return next(e)
+  })
+
+  // Runs before each compaction. The engine's idle compaction, ahead of the cache's expiry,
+  // arrives as 'auto' between turns; the one at the context threshold arrives as 'auto' inside
+  // a turn, and passes. A prompt just sent counts as a turn, since its turn.start may still be queued.
+  on('session.compact', { trigger: 'auto' }, async ($, e, next) => {
+    if (e.agentId || !(await read($, idleCompactionOff)) || (await read($, turnActive))) return next(e)
+    const sent = await read($, promptAt)
+    if (sent !== null && (await $.clock.now()) - sent < PROMPT_GRACE_MS) return next(e)
+    return { skip: IDLE_SKIP }
   })
 
   // Runs for each request to the model
@@ -118,22 +161,45 @@ export function register(on) {
     })
   })
 
-  // Runs each time Claude Code draws the band above the prompt: the desktop's indicator, at the
-  // right, with its ring an SVG the size of the context ring
+  // Runs each time Claude Code draws the band above the prompt: the desktop's island, this
+  // session's idle compaction switch at the left and its cache ring and time at the right
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.surface !== 'desktop' || e.props.hasSurvey) return next(e)
     const now = await readout($)
     if (!now) return next(e)
-    const { Box, Text, Svg } = $.ui.resolve(e)
+    const { Box, Text, Svg, Button } = $.ui.resolve(e)
+    const off = await read($, idleCompactionOff)
+    // The desktop draws a button's label in one color: the text color while on, dim while off
+    const toggle = Button({
+      key: 'idle-compaction',
+      label: off ? '○  Idle compact  Off' : '●  Idle compact  On',
+      ...(off && { dimColor: true }),
+      onPress: () => toggleIdleCompaction($),
+    })
     const ring = Svg({ source: ringSvg(now), alt: 'Prompt cache: ' + now.label, width: 14, height: 14 })
-    const label = Text({ ...LABEL_STYLE[now.level], children: [now.label] })
+    const label = Text({ ...BAND_LABEL_STYLE[now.level], children: [now.label] })
     return Box({
       flexDirection: 'row',
-      justifyContent: 'flex-end',
+      justifyContent: 'space-between',
+      alignItems: 'center',
       width: e.props.bodyColumns,
-      children: [Box({ flexDirection: 'row', alignItems: 'center', columnGap: 1, children: [ring, label] })],
+      children: [toggle, Box({ flexDirection: 'row', alignItems: 'center', columnGap: 1, children: [ring, label] })],
     })
   })
+}
+
+// Turns this session's idle compaction off or back on, and keeps the choice for a resume
+async function toggleIdleCompaction($) {
+  await update($, idleCompactionOff, (off) => !off)
+  const off = await read($, idleCompactionOff)
+  const key = idleKey(await $.session.id())
+  if (off) await $.store.set(key, true)
+  else await $.store.delete(key)
+}
+
+// The store key that holds a session's idle compaction choice
+function idleKey(sessionId) {
+  return 'idle-off:' + sessionId
 }
 
 // Where the countdown stands now, or null before the first request

@@ -12,9 +12,9 @@ const USAGE = {
 }
 
 // What the world beneath the mod answers: no transcript on disk, no saved /cache-ttl choice
-function world(on: any, transcript = '', options: { noTail?: boolean } = {}) {
+function world(on: any, transcript = '', options: { noTail?: boolean; store?: Record<string, unknown> } = {}) {
   const clock = mock.clock(on, { now: START })
-  mock.store(on)
+  mock.store(on, options.store)
   mock.env(on, { HOME: '/Users/test' })
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { command: 'cache-ttl' } }))
@@ -37,8 +37,21 @@ function world(on: any, transcript = '', options: { noTail?: boolean } = {}) {
   on('turn.step', async function* (_$: any, e: any) {
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: USAGE }
   })
+  on('prompt.submit', (_$: any, e: any) => ({ text: e.text }))
+  on('turn.start', (_$: any, e: any) => ({ turnId: e.turnId }))
+  on('turn.complete', (_$: any, e: any) => ({ text: e.answer }))
+  // The engine compacts whatever reaches it into one summary
+  on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] }))
   return clock
 }
+
+// A compaction raised as the engine raises it: 'auto' for its threshold and its idle compaction
+function compact($: any, trigger: 'auto' | 'manual') {
+  return $.session.compact({ trigger, messages: [{ role: 'user', text: 'hello', toolUses: [] }] })
+}
+
+const ON_LABEL = '●  Idle compact  On'
+const OFF_LABEL = '○  Idle compact  Off'
 
 async function start($: any) {
   await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
@@ -100,25 +113,27 @@ describe('cache-ttl-timer', () => {
     const clock = world(on)
     await start($)
     await step($)
-    const expectEach = async (glyph: string, text: string, style: Record<string, unknown>) => {
+    const expectEach = async (glyph: string, text: string, level: 'warm' | 'warn' | 'cold') => {
       for (const surface of SURFACES) {
         const ui = await indicator($, surface)
         const t = await label(ui)
         // The terminal's ring is a glyph before the time; the desktop's is an SVG beside it
         expect(t?.text).toBe(surface === 'terminal' ? glyph + ' ' + text : text)
-        expect(t?.props).toEqual(expect.objectContaining(style))
+        // Warm, the terminal's label is the footer's dim gray and the desktop's the text color
+        if (level === 'warn') expect(t?.props.color).toBe('warning')
+        else expect(t?.props.dimColor).toBe(level === 'cold' || surface === 'terminal' ? true : undefined)
         expect(Boolean(await ui.find({ type: 'Svg' }))).toBe(surface === 'desktop')
         await ui.unmount()
       }
     }
     await clock.advance(1000)
-    await expectEach('●', '60m', { dimColor: true })
+    await expectEach('●', '60m', 'warm')
     await clock.set(START + 50 * MIN)
-    await expectEach('◔', '10m', { color: 'warning' })
+    await expectEach('◔', '10m', 'warn')
     await clock.set(START + 59 * MIN + 18_000)
-    await expectEach('○', '0:42', { color: 'warning' })
+    await expectEach('○', '0:42', 'warn')
     await clock.set(START + 60 * MIN + 1000)
-    await expectEach('◌', 'Cold', { dimColor: true })
+    await expectEach('◌', 'Cold', 'cold')
   })
 
   test("the desktop's band draws the ring as an SVG image, amber in the last fifth, dashed with no arc once cold", async ($, on) => {
@@ -155,13 +170,14 @@ describe('cache-ttl-timer', () => {
     expect(await alone.find({ type: 'Text', text: /^ · $/ })).toBeUndefined()
   })
 
-  test("the desktop draws the indicator above the prompt, at the right, and leaves the footer's labels to Claude Code", async ($, on) => {
+  test("the desktop draws the island above the prompt and leaves the footer's labels to Claude Code", async ($, on) => {
     world(on)
     await start($)
     await step($)
     const desktopBand = await band($, 'desktop')
     expect(await labelText(desktopBand)).toBe('60m')
-    expect((await desktopBand.find({ type: 'Box' }))?.props.justifyContent).toBe('flex-end')
+    // The switch at the left, the ring and the time at the right
+    expect((await desktopBand.find({ type: 'Box' }))?.props.justifyContent).toBe('space-between')
     // The desktop draws the footer's labels on a row of their own under the model and effort
     const desktopFooter = await footer($, 'desktop', [])
     expect(await label(desktopFooter)).toBeUndefined()
@@ -171,6 +187,53 @@ describe('cache-ttl-timer', () => {
     // A survey holds the band
     const surveyBand = await band($, 'desktop', { hasSurvey: true })
     expect(await label(surveyBand)).toBeUndefined()
+  })
+
+  test("the band's button turns idle compaction off and back on, dimming while off", async ($, on) => {
+    world(on)
+    await start($)
+    await step($)
+    const ui = await band($, 'desktop')
+    const button = () => ui.find({ type: 'Button' })
+    expect((await button())?.props).toEqual(expect.objectContaining({ key: 'idle-compaction', label: ON_LABEL }))
+    expect((await button())?.props.dimColor).toBeUndefined()
+    await ui.press({ key: 'idle-compaction' })
+    expect((await button())?.props).toEqual(expect.objectContaining({ label: OFF_LABEL, dimColor: true }))
+    await ui.press({ key: 'idle-compaction' })
+    expect((await button())?.props.label).toBe(ON_LABEL)
+  })
+
+  test('while off, an idle compaction is skipped; one inside a turn, right after a prompt, or by hand goes on', async ($, on) => {
+    const clock = world(on)
+    await start($)
+    await step($)
+    // On, the engine's idle compaction goes on
+    expect((await compact($, 'auto')).skip).toBeUndefined()
+    const ui = await band($, 'desktop')
+    await ui.press({ key: 'idle-compaction' })
+    // Off and idle: skipped
+    expect((await compact($, 'auto')).skip).toBe('Idle compaction is off for this session')
+    // The threshold's compaction inside a turn goes on
+    await $.turn.start({ text: 'go on', turnId: 't2' })
+    expect((await compact($, 'auto')).skip).toBeUndefined()
+    await $.turn.complete({ turnId: 't2', answer: '', durationMs: 1, isAborted: false, reason: 'answer' })
+    expect((await compact($, 'auto')).skip).toBe('Idle compaction is off for this session')
+    // A prompt just sent opens a turn whose turn.start may still be queued
+    await $.prompt.submit({ text: 'next', wait: false, origin: { kind: 'composer' } })
+    expect((await compact($, 'auto')).skip).toBeUndefined()
+    await clock.advance(3 * MIN)
+    expect((await compact($, 'auto')).skip).toBe('Idle compaction is off for this session')
+    // /compact is the person's own
+    expect((await compact($, 'manual')).skip).toBeUndefined()
+  })
+
+  test('the off choice is kept for the session across a resume', async ($, on) => {
+    world(on, '', { store: { 'idle-off:session-1': true } })
+    await start($)
+    await step($)
+    const ui = await band($, 'desktop')
+    expect((await ui.find({ type: 'Button' }))?.props.label).toBe(OFF_LABEL)
+    expect((await compact($, 'auto')).skip).toBe('Idle compaction is off for this session')
   })
 
   test("a subagent's request doesn't restart the countdown", async ($, on) => {
