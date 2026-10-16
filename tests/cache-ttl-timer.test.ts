@@ -12,9 +12,25 @@ const USAGE = {
 }
 
 // What the world beneath the mod answers: no transcript on disk, no saved /cache-ttl choice
-function world(on: any, transcript = '', options: { noTail?: boolean; store?: Record<string, unknown> } = {}) {
+function world(
+  on: any,
+  transcript = '',
+  options: { tooLarge?: boolean; store?: Record<string, unknown>; kept?: Map<string, unknown> } = {},
+) {
   const clock = mock.clock(on, { now: START })
-  mock.store(on, options.store)
+  const kept = options.kept
+  if (kept) {
+    // A store the test reads back afterwards
+    on('store.get', (_$: any, e: any) => ({ value: kept.get(e.key) }))
+    on('store.set', (_$: any, e: any) => {
+      kept.set(e.key, e.value)
+      return { value: undefined }
+    })
+    on('store.delete', (_$: any, e: any) => {
+      kept.delete(e.key)
+      return { value: undefined }
+    })
+  } else mock.store(on, options.store)
   mock.env(on, { HOME: '/Users/test' })
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { command: 'cache-ttl' } }))
@@ -28,10 +44,10 @@ function world(on: any, transcript = '', options: { noTail?: boolean; store?: Re
   }))
   // Claude Code's own drawing of the footer labels
   on('ui.render', () => ({ type: 'engine', ref: 0 }))
-  on('process.run', () => {
-    // Where tail is missing, as on Windows, the process can't start
-    if (options.noTail) throw new Error('spawn tail ENOENT')
-    return { value: { exitCode: 0, stdout: transcript, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  on('fs.read', () => {
+    // A transcript over 4 MiB, which $.fs.read refuses
+    if (options.tooLarge) throw new Error('EFBIG: file is over 4 MiB')
+    return { value: transcript }
   })
   // The model's answer to every request
   on('turn.step', async function* (_$: any, e: any) {
@@ -288,14 +304,21 @@ describe('cache-ttl-timer', () => {
     expect(bad.text).toContain('Use /cache-ttl')
   })
 
-  test('without `tail` (Windows) the countdown still runs, on the default TTL, and no hook fails', async ($, on) => {
-    world(on, '', { noTail: true })
+  test('a transcript too large to read falls back to what the session last kept', async ($, on) => {
+    world(on, '', { tooLarge: true, store: { 'last:session-1': { sentAt: START - 50 * MIN, ttl: '1h' } } })
     await start($)
     await $.classic.Stop({ stop_hook_active: false, transcript_path: '/t.jsonl' })
-    await step($)
     const ui = await footer($, 'terminal')
-    expect((await label(ui))?.text).toBe('● 60m')
+    expect((await label(ui))?.text).toBe('◔ 10m')
     const reply = await cacheTtl($, '')
-    expect(reply.text).toContain('TTL 1h (default)')
+    expect(reply.text).toContain('TTL 1h (from the transcript)')
+  })
+
+  test('each request is kept for the next resume', async ($, on) => {
+    const kept = new Map<string, unknown>()
+    world(on, '', { tooLarge: true, kept })
+    await start($)
+    await step($)
+    expect(kept.get('last:session-1')).toEqual({ sentAt: START, ttl: null })
   })
 })

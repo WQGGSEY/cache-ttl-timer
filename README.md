@@ -69,18 +69,19 @@ To turn it off, disable the plugin in `/plugin`.
 
 Everything stays on your machine. The mod makes no network requests, calls no model, and doesn't change prompts, tool calls, or permissions. It observes requests to time them, and, only while you've turned idle compaction off for a session, skips that session's idle compaction.
 
-- **What it sends out**: nothing. It reads the conversation's transcript and keeps what it learns (request times and the TTL) in the session's state and the plugin's local store. No hook or call passes data to the network, a model, another program's input, or a file outside the plugin store.
-- **Programs it runs**: one, `tail`, as `tail -c 4000000 <transcript>`, where `<transcript>` is the current session's transcript file under `~/.claude/projects`. Every other part of the command is fixed text. It runs when a session starts or resumes and when a turn stops, to read the transcript's last 4 MB, because `$.fs.read` refuses files over 4 MiB and a long session's transcript is larger. Its output is parsed in the mod for request timestamps and cache token counts, then discarded. `tail` reads a local file and opens no connection.
+- **What it sends out**: nothing, anywhere. It makes no network request, starts no program, calls no model, and writes no file. What it learns from the transcript, the last request's time and the TTL, stays in the session's state and the plugin's own store on your machine.
+- **Programs it runs**: none.
+- **What its hooks change**: only an idle compaction, and only while you've turned it off for the session (`session.compact` returns a skip). `classic.SessionStart` and `classic.Stop` read the transcript's path and pass the event on unchanged, adding no context. `prompt.submit` notes when you sent a prompt and passes the prompt on unchanged. `turn.step`, `turn.start` and `turn.complete` note when requests and turns happen and pass them on unchanged. `command.run` answers `/cache-ttl` alone, and `ui.render` draws the timer and the button.
 
 - **Hooks**: `session.start`, `classic.SessionStart`, `classic.Stop` and `turn.step` to follow requests; `prompt.submit`, `turn.start` and `turn.complete` to know when a turn is running; `session.compact` (trigger `auto`) to skip an idle compaction between turns; `command.run` for `/cache-ttl`; `ui.render` for the terminal's footer (`SessionMode`) and the desktop's band above the prompt (`AbovePrompt`).
-- **Files**: the current session's transcript, found under `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`) by the session's id. It reads the transcript's last 4 MB with `tail` (above), and looks only at request timestamps and cache token counts. On a project path longer than 200 characters it lists `~/.claude/projects` to find the session's folder.
+- **Files**: the current session's transcript, found under `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`) by the session's id, read with `$.fs.read` when a session starts or resumes and when Claude stops answering. It looks only at request timestamps and cache token counts. `$.fs.read` refuses a file over 4 MiB; for a transcript that large the mod uses what it last kept for the session. On a project path longer than 200 characters it lists `~/.claude/projects` to find the session's folder.
 - **Environment**: `HOME` and `CLAUDE_CONFIG_DIR`, to find that folder.
-- **Storage**: the TTL you choose with `/cache-ttl 5m|1h`, and `idle-off:<session id>` for each session with idle compaction off, in the plugin's own key-value store under `~/.claude/plugins/store/`; the last request time, the detected TTL, whether a turn is running and when you last sent a prompt, in the session's state.
+- **Storage**: the TTL you choose with `/cache-ttl 5m|1h`, `last:<session id>` with each session's last request time and TTL, and `idle-off:<session id>` for each session with idle compaction off, in the plugin's own key-value store under `~/.claude/plugins/store/`; the last request time, the detected TTL, whether a turn is running and when you last sent a prompt, in the session's state.
 - **Timer**: once a second it checks whether the label or the ring changed, and redraws only then: a few times a minute, and once a second in the last minute.
 
 ## Limitations
 
-- On Windows, where `tail` isn't available, the timer can't read the transcript. It still counts down from each request, on the 1-hour default; set the TTL with `/cache-ttl 5m` if your sessions use 5 minutes. A resumed session shows the timer only after its next request.
+- Once a transcript passes 4 MiB the mod can't read it, so the TTL stays the last one it read, and a session that was already that large before the mod first saw it shows the timer only after its next request, on the 1-hour default. Set the TTL with `/cache-ttl 5m` if your sessions use 5 minutes.
 - The transcript format isn't a public interface. If a release changes it, TTL detection falls back to the default.
 
 ## Development

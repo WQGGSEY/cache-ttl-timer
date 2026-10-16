@@ -5,7 +5,8 @@
 // The main conversation's cache entry lives for its TTL after the last request
 // that used it. The countdown starts when each main-loop request is sent
 // (turn.step), and the TTL (5m or 1h) is read from the transcript, where the
-// API's usage records how many tokens were written at each TTL.
+// API's usage records how many tokens were written at each TTL. Both are kept in
+// the plugin's store per session, for a transcript too large to read.
 import { atom, read, update } from 'claude-code'
 
 // When the main conversation last used its cache, in $.clock.now() milliseconds; null before any request
@@ -120,7 +121,10 @@ export function register(on) {
     const sentAt = await $.clock.now()
     const result = yield* next(e)
     // A request that got an answer read or wrote the cache, which restarts its TTL
-    if (result.usage) await update($, lastHit, (prev) => Math.max(prev ?? 0, sentAt))
+    if (result.usage) {
+      await update($, lastHit, (prev) => Math.max(prev ?? 0, sentAt))
+      await remember($)
+    }
     return result
   })
 
@@ -275,22 +279,32 @@ async function statusText($) {
   return head + ' · ' + ago + ' · ' + state + ' · ' + drawn
 }
 
-// Reads the transcript's end and records the TTL of the latest cache write, and the last request if it's newer.
-// Where `tail` is missing (Windows) the countdown still runs, on the default TTL.
+// Reads the transcript and records the TTL of the latest cache write, and the last request if it's newer.
+// A transcript over $.fs.read's 4 MiB falls back to what this session last kept in the store.
 async function learnFromTranscript($, path) {
   if (!path) return
-  let out
+  let text = null
   try {
-    // The last 4 MB: enough to hold the last response after a large tool result
-    out = await $.process.run(['tail', '-c', '4000000', path])
+    text = await $.fs.read(path)
   } catch {
-    return
+    // Missing, or too large to read
   }
-  if (out.exitCode !== 0) return
-  const found = parseTail(out.stdout)
-  if (!found) return
-  if (found.ttl) await update($, detectedTtl, () => found.ttl)
+  const found = text === null ? await $.store.get(lastKey(await $.session.id())) : parseTranscript(text)
+  if (!found || typeof found.sentAt !== 'number') return
+  if (found.ttl === '5m' || found.ttl === '1h') await update($, detectedTtl, () => found.ttl)
   await update($, lastHit, (prev) => Math.max(prev ?? 0, found.sentAt))
+  if (text !== null) await remember($)
+}
+
+// Keeps this session's last request and TTL in the store, for a transcript too large to read
+async function remember($) {
+  const sentAt = await read($, lastHit)
+  if (sentAt === null) return
+  await $.store.set(lastKey(await $.session.id()), { sentAt, ttl: await read($, detectedTtl) })
+}
+
+function lastKey(sessionId) {
+  return 'last:' + sessionId
 }
 
 // The session's transcript under ~/.claude/projects, where Claude Code names it by the session id
@@ -312,7 +326,7 @@ async function transcriptPath($) {
 }
 
 // From transcript lines: when the last main-conversation request was sent, and the TTL of the latest cache write
-export function parseTail(text) {
+export function parseTranscript(text) {
   let sentAt = null
   let ttl = null
   let lastUserAt = null
@@ -323,7 +337,7 @@ export function parseTail(text) {
     try {
       row = JSON.parse(line)
     } catch {
-      // The first line of a tail is usually cut
+      // A line still being written
       continue
     }
     if (row.isSidechain) continue
