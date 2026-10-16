@@ -24,8 +24,6 @@ const TTL_MS = { '5m': 5 * 60 * 1000, '1h': 60 * 60 * 1000 }
 const DEFAULT_TTL = '1h'
 // The share of the TTL left when the countdown turns amber
 const WARN_FRACTION = 0.2
-// How much of the transcript's end to read: enough to hold the last response after a large tool result
-const TAIL_BYTES = '4000000'
 // Claude Code names a project's folder after its path, cut to this length
 const PROJECT_SLUG_MAX = 200
 // How many steps the ring drains in: every 30 seconds of a 1h TTL, so it redraws rarely
@@ -283,7 +281,8 @@ async function learnFromTranscript($, path) {
   if (!path) return
   let out
   try {
-    out = await $.process.run(['tail', '-c', TAIL_BYTES, path])
+    // The last 4 MB: enough to hold the last response after a large tool result
+    out = await $.process.run(['tail', '-c', '4000000', path])
   } catch {
     return
   }
