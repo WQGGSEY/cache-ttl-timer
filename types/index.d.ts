@@ -3,9 +3,6 @@ declare module 'claude-code' {
     'cache-ttl-timer': {
       lastHit: number | null
       detectedTtl: '5m' | '1h' | null
-      turnActive: boolean
-      promptAt: number | null
-      idleCompactionOff: boolean
     }
   }
 }

@@ -1,30 +1,23 @@
-// cache-ttl-timer: a prompt-cache countdown beside the mode labels in the terminal's prompt
-// footer, and in the band above the prompt on the desktop, where a button also turns the
-// engine's idle compaction off or on for the session.
+// cache-ttl-timer: a prompt-cache countdown beside the mode labels in the prompt footer.
 //
 // The main conversation's cache entry lives for its TTL after the last request
 // that used it. The countdown starts when each main-loop request is sent
 // (turn.step), and the TTL (5m or 1h) is read from the transcript, where the
-// API's usage records how many tokens were written at each TTL. Both are kept in
-// the plugin's store per session, for a transcript too large to read.
+// API's usage records how many tokens were written at each TTL.
 import { atom, read, update } from 'claude-code'
 
 // When the main conversation last used its cache, in $.clock.now() milliseconds; null before any request
 const lastHit = atom({ plugin: 'cache-ttl-timer', key: 'lastHit' }, null)
 // The TTL the latest cache write used, as the transcript reports it; null until one is seen
 const detectedTtl = atom({ plugin: 'cache-ttl-timer', key: 'detectedTtl' }, null)
-// Whether a model turn of the main conversation is running
-const turnActive = atom({ plugin: 'cache-ttl-timer', key: 'turnActive' }, false)
-// When the person last sent a prompt, in $.clock.now() milliseconds; null before any
-const promptAt = atom({ plugin: 'cache-ttl-timer', key: 'promptAt' }, null)
-// Whether this session refuses the engine's idle compaction, from the band's button
-const idleCompactionOff = atom({ plugin: 'cache-ttl-timer', key: 'idleCompactionOff' }, false)
 
 const TTL_MS = { '5m': 5 * 60 * 1000, '1h': 60 * 60 * 1000 }
 // What Claude Code asks for on the main thread of a subscription that isn't in overage
 const DEFAULT_TTL = '1h'
 // The share of the TTL left when the countdown turns amber
 const WARN_FRACTION = 0.2
+// How much of the transcript's end to read: enough to hold the last response after a large tool result
+const TAIL_BYTES = '4000000'
 // Claude Code names a project's folder after its path, cut to this length
 const PROJECT_SLUG_MAX = 200
 // How many steps the ring drains in: every 30 seconds of a 1h TTL, so it redraws rarely
@@ -37,12 +30,6 @@ const GLYPHS = ['●', '◕', '◑', '◔', '○']
 const COLD_GLYPH = '◌'
 // Label colors by level: the footer's own dim gray, the theme's warning, and dim again once cold
 const LABEL_STYLE = { warm: { dimColor: true }, warn: { color: 'warning' }, cold: { dimColor: true } }
-// The band's label: the text color while warm, the warning in the last fifth, dim once cold
-const BAND_LABEL_STYLE = { warm: {}, warn: { color: 'warning' }, cold: { dimColor: true } }
-// A prompt sent this recently opens a turn whose turn.start may not have arrived yet
-const PROMPT_GRACE_MS = 2 * 60 * 1000
-// What the transcript says when this session skips an idle compaction
-const IDLE_SKIP = 'Idle compaction is off for this session'
 // The desktop ring's arc by level
 const RING_COLOR = { warm: '#9a9a9a', warn: '#d99a2b' }
 
@@ -50,6 +37,8 @@ const RING_COLOR = { warm: '#9a9a9a', warn: '#d99a2b' }
 let override = null
 // What the indicator last drew, so the ticker redraws only when the label or the ring changes
 let drawnKey = ''
+// Whether the desktop has asked for the footer's mode labels; until it does, the band above the prompt stands in
+let desktopFooterSeen = false
 
 export function register(on) {
   // Runs before the first prompt, and again after a reload
@@ -61,9 +50,6 @@ export function register(on) {
     })
     const saved = await $.store.get('override')
     override = saved === '5m' || saved === '1h' ? saved : null
-    // This session's idle compaction choice, kept across a resume
-    const off = (await $.store.get(idleKey(await $.session.id()))) === true
-    await update($, idleCompactionOff, () => off)
     // After a reload or a resume, pick the countdown up from the transcript
     try {
       const path = await transcriptPath($)
@@ -87,33 +73,6 @@ export function register(on) {
     return next(e)
   })
 
-  // Runs when the person sends a prompt, before the turn it opens
-  on('prompt.submit', async ($, e, next) => {
-    const at = await $.clock.now()
-    await update($, promptAt, () => at)
-    return next(e)
-  })
-
-  // Runs when a turn of the main conversation begins and ends
-  on('turn.start', async ($, e, next) => {
-    await update($, turnActive, () => true)
-    return next(e)
-  })
-  on('turn.complete', async ($, e, next) => {
-    if (!e.agentId) await update($, turnActive, () => false)
-    return next(e)
-  })
-
-  // Runs before each compaction. The engine's idle compaction, ahead of the cache's expiry,
-  // arrives as 'auto' between turns; the one at the context threshold arrives as 'auto' inside
-  // a turn, and passes. A prompt just sent counts as a turn, since its turn.start may still be queued.
-  on('session.compact', { trigger: 'auto' }, async ($, e, next) => {
-    if (e.agentId || !(await read($, idleCompactionOff)) || (await read($, turnActive))) return next(e)
-    const sent = await read($, promptAt)
-    if (sent !== null && (await $.clock.now()) - sent < PROMPT_GRACE_MS) return next(e)
-    return { skip: IDLE_SKIP }
-  })
-
   // Runs for each request to the model
   on('turn.step', async function* ($, e, next) {
     // A subagent caches its own prefix; the footer follows the main conversation
@@ -121,10 +80,7 @@ export function register(on) {
     const sentAt = await $.clock.now()
     const result = yield* next(e)
     // A request that got an answer read or wrote the cache, which restarts its TTL
-    if (result.usage) {
-      await update($, lastHit, (prev) => Math.max(prev ?? 0, sentAt))
-      await remember($)
-    }
+    if (result.usage) await update($, lastHit, (prev) => Math.max(prev ?? 0, sentAt))
     return result
   })
 
@@ -144,17 +100,19 @@ export function register(on) {
     return { text: await statusText($) }
   })
 
-  // Runs each time Claude Code draws the mode labels in the prompt footer. Only the terminal's
-  // footer holds them beside the model and effort: the desktop app lays the model and effort out
-  // in a row under the prompt and draws these labels on a row of their own beneath it.
+  // Runs each time Claude Code draws the mode labels in the prompt footer
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
-    if (e.surface !== 'terminal') return next(e)
+    if (e.surface === 'desktop' && !desktopFooterSeen) {
+      desktopFooterSeen = true
+      // Take the stand-in above the prompt down
+      $.ui.invalidate('ui.render')
+    }
     const now = await readout($)
     if (!now) return next(e)
-    const { Box, Text } = $.ui.resolve(e)
-    const indicator = Text({ ...LABEL_STYLE[now.level], children: [ringGlyph(now) + ' ' + now.label] })
+    const indicator = await drawIndicator($, e, now)
     if (e.props.modes.length === 0) return indicator
     // Keep Claude Code's labels, with the indicator after them
+    const { Box, Text } = $.ui.resolve(e)
     const theirs = await next(e)
     return Box({
       flexDirection: 'row',
@@ -163,45 +121,33 @@ export function register(on) {
     })
   })
 
-  // Runs each time Claude Code draws the band above the prompt: the desktop's island, this
-  // session's idle compaction switch at the left and its cache ring and time at the right
+  // Runs each time Claude Code draws the band above the prompt. A desktop that never asks for
+  // the footer's mode labels gets the indicator here instead, at the right, above the context ring.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.surface !== 'desktop' || e.props.hasSurvey) return next(e)
+    if (e.surface !== 'desktop' || desktopFooterSeen || e.props.hasSurvey) return next(e)
     const now = await readout($)
     if (!now) return next(e)
-    const { Box, Text, Svg, Button } = $.ui.resolve(e)
-    const off = await read($, idleCompactionOff)
-    // The desktop draws a button's label in one color: the text color while on, dim while off
-    const toggle = Button({
-      key: 'idle-compaction',
-      label: off ? '○  Idle compact  Off' : '●  Idle compact  On',
-      ...(off && { dimColor: true }),
-      onPress: () => toggleIdleCompaction($),
-    })
-    const ring = Svg({ source: ringSvg(now), alt: 'Prompt cache: ' + now.label, width: 14, height: 14 })
-    const label = Text({ ...BAND_LABEL_STYLE[now.level], children: [now.label] })
+    const { Box } = $.ui.resolve(e)
     return Box({
       flexDirection: 'row',
-      justifyContent: 'space-between',
-      alignItems: 'center',
+      justifyContent: 'flex-end',
       width: e.props.bodyColumns,
-      children: [toggle, Box({ flexDirection: 'row', alignItems: 'center', columnGap: 1, children: [ring, label] })],
+      children: [await drawIndicator($, e, now)],
     })
   })
 }
 
-// Turns this session's idle compaction off or back on, and keeps the choice for a resume
-async function toggleIdleCompaction($) {
-  await update($, idleCompactionOff, (off) => !off)
-  const off = await read($, idleCompactionOff)
-  const key = idleKey(await $.session.id())
-  if (off) await $.store.set(key, true)
-  else await $.store.delete(key)
-}
-
-// The store key that holds a session's idle compaction choice
-function idleKey(sessionId) {
-  return 'idle-off:' + sessionId
+// The indicator itself: a ring and its label. The footer draws text alone on every surface (the
+// desktop drops images there), so its ring is a glyph; the desktop's band above the prompt draws
+// images, so there the ring is an SVG the size of the context ring.
+async function drawIndicator($, e, now) {
+  const { Box, Text, Svg } = $.ui.resolve(e)
+  if (e.surface === 'desktop' && e.component === 'AbovePrompt') {
+    const ring = Svg({ source: ringSvg(now), alt: 'Prompt cache: ' + now.label, width: 14, height: 14 })
+    const label = Text({ ...LABEL_STYLE[now.level], children: [now.label] })
+    return Box({ flexDirection: 'row', alignItems: 'center', columnGap: 1, children: [ring, label] })
+  }
+  return Text({ ...LABEL_STYLE[now.level], children: [ringGlyph(now) + ' ' + now.label] })
 }
 
 // Where the countdown stands now, or null before the first request
@@ -279,32 +225,21 @@ async function statusText($) {
   return head + ' · ' + ago + ' · ' + state + ' · ' + drawn
 }
 
-// Reads the transcript and records the TTL of the latest cache write, and the last request if it's newer.
-// A transcript over $.fs.read's 4 MiB falls back to what this session last kept in the store.
+// Reads the transcript's end and records the TTL of the latest cache write, and the last request if it's newer.
+// Where `tail` is missing (Windows) the countdown still runs, on the default TTL.
 async function learnFromTranscript($, path) {
   if (!path) return
-  let text = null
+  let out
   try {
-    text = await $.fs.read(path)
+    out = await $.process.run(['tail', '-c', TAIL_BYTES, path])
   } catch {
-    // Missing, or too large to read
+    return
   }
-  const found = text === null ? await $.store.get(lastKey(await $.session.id())) : parseTranscript(text)
-  if (!found || typeof found.sentAt !== 'number') return
-  if (found.ttl === '5m' || found.ttl === '1h') await update($, detectedTtl, () => found.ttl)
+  if (out.exitCode !== 0) return
+  const found = parseTail(out.stdout)
+  if (!found) return
+  if (found.ttl) await update($, detectedTtl, () => found.ttl)
   await update($, lastHit, (prev) => Math.max(prev ?? 0, found.sentAt))
-  if (text !== null) await remember($)
-}
-
-// Keeps this session's last request and TTL in the store, for a transcript too large to read
-async function remember($) {
-  const sentAt = await read($, lastHit)
-  if (sentAt === null) return
-  await $.store.set(lastKey(await $.session.id()), { sentAt, ttl: await read($, detectedTtl) })
-}
-
-function lastKey(sessionId) {
-  return 'last:' + sessionId
 }
 
 // The session's transcript under ~/.claude/projects, where Claude Code names it by the session id
@@ -326,7 +261,7 @@ async function transcriptPath($) {
 }
 
 // From transcript lines: when the last main-conversation request was sent, and the TTL of the latest cache write
-export function parseTranscript(text) {
+export function parseTail(text) {
   let sentAt = null
   let ttl = null
   let lastUserAt = null
@@ -337,7 +272,7 @@ export function parseTranscript(text) {
     try {
       row = JSON.parse(line)
     } catch {
-      // A line still being written
+      // The first line of a tail is usually cut
       continue
     }
     if (row.isSidechain) continue

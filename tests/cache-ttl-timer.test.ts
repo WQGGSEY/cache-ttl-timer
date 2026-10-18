@@ -12,25 +12,9 @@ const USAGE = {
 }
 
 // What the world beneath the mod answers: no transcript on disk, no saved /cache-ttl choice
-function world(
-  on: any,
-  transcript = '',
-  options: { tooLarge?: boolean; store?: Record<string, unknown>; kept?: Map<string, unknown> } = {},
-) {
+function world(on: any, transcript = '', options: { noTail?: boolean } = {}) {
   const clock = mock.clock(on, { now: START })
-  const kept = options.kept
-  if (kept) {
-    // A store the test reads back afterwards
-    on('store.get', (_$: any, e: any) => ({ value: kept.get(e.key) }))
-    on('store.set', (_$: any, e: any) => {
-      kept.set(e.key, e.value)
-      return { value: undefined }
-    })
-    on('store.delete', (_$: any, e: any) => {
-      kept.delete(e.key)
-      return { value: undefined }
-    })
-  } else mock.store(on, options.store)
+  mock.store(on)
   mock.env(on, { HOME: '/Users/test' })
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { command: 'cache-ttl' } }))
@@ -44,30 +28,17 @@ function world(
   }))
   // Claude Code's own drawing of the footer labels
   on('ui.render', () => ({ type: 'engine', ref: 0 }))
-  on('fs.read', () => {
-    // A transcript over 4 MiB, which $.fs.read refuses
-    if (options.tooLarge) throw new Error('EFBIG: file is over 4 MiB')
-    return { value: transcript }
+  on('process.run', () => {
+    // Where tail is missing, as on Windows, the process can't start
+    if (options.noTail) throw new Error('spawn tail ENOENT')
+    return { value: { exitCode: 0, stdout: transcript, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   // The model's answer to every request
   on('turn.step', async function* (_$: any, e: any) {
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: USAGE }
   })
-  on('prompt.submit', (_$: any, e: any) => ({ text: e.text }))
-  on('turn.start', (_$: any, e: any) => ({ turnId: e.turnId }))
-  on('turn.complete', (_$: any, e: any) => ({ text: e.answer }))
-  // The engine compacts whatever reaches it into one summary
-  on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] }))
   return clock
 }
-
-// A compaction raised as the engine raises it: 'auto' for its threshold and its idle compaction
-function compact($: any, trigger: 'auto' | 'manual') {
-  return $.session.compact({ trigger, messages: [{ role: 'user', text: 'hello', toolUses: [] }] })
-}
-
-const ON_LABEL = '●  Idle compact  On'
-const OFF_LABEL = '○  Idle compact  Off'
 
 async function start($: any) {
   await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
@@ -99,18 +70,8 @@ async function labelText(ui: any) {
   return t ? String(t.text).replace(/^[●◕◑◔○◌] /, '') : undefined
 }
 
-function band($: any, surface: 'desktop' | 'terminal', props: Record<string, unknown> = {}) {
-  return $.ui.mount({ plugin: 'cache-ttl-timer', surface, component: 'AbovePrompt', props: { ...BAND, ...props } })
-}
-
-// Where each surface draws the indicator: the terminal's footer, the desktop's band above the prompt
-function indicator($: any, surface: 'desktop' | 'terminal') {
-  return surface === 'terminal' ? footer($, surface) : band($, surface)
-}
-
-// /cache-ttl as typed at the prompt
-function cacheTtl($: any, args: string) {
-  return $.command.run({ command: 'cache-ttl', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } })
+function band($: any, surface: 'desktop' | 'terminal') {
+  return $.ui.mount({ plugin: 'cache-ttl-timer', surface, component: 'AbovePrompt', props: BAND })
 }
 
 describe('cache-ttl-timer', () => {
@@ -118,38 +79,36 @@ describe('cache-ttl-timer', () => {
     world(on)
     await start($)
     for (const surface of SURFACES) {
-      const ui = await indicator($, surface)
+      const ui = await footer($, surface)
       expect(await label(ui)).toBeUndefined()
       await ui.unmount()
     }
   })
 
   // Moving the clock an hour runs the once-a-second ticker 3,600 times
-  test('shows the ring and the time: gray, then the warning color in the last fifth, then cold', { timeoutMs: 60_000 }, async ($, on) => {
+  test('the footer shows a glyph ring and the time: gray, then the warning color in the last fifth, then cold', { timeoutMs: 60_000 }, async ($, on) => {
     const clock = world(on)
     await start($)
     await step($)
-    const expectEach = async (glyph: string, text: string, level: 'warm' | 'warn' | 'cold') => {
+    const expectEach = async (text: string, style: Record<string, unknown>) => {
       for (const surface of SURFACES) {
-        const ui = await indicator($, surface)
+        const ui = await footer($, surface)
         const t = await label(ui)
-        // The terminal's ring is a glyph before the time; the desktop's is an SVG beside it
-        expect(t?.text).toBe(surface === 'terminal' ? glyph + ' ' + text : text)
-        // Warm, the terminal's label is the footer's dim gray and the desktop's the text color
-        if (level === 'warn') expect(t?.props.color).toBe('warning')
-        else expect(t?.props.dimColor).toBe(level === 'cold' || surface === 'terminal' ? true : undefined)
-        expect(Boolean(await ui.find({ type: 'Svg' }))).toBe(surface === 'desktop')
+        expect(t?.text).toBe(text)
+        expect(t?.props).toEqual(expect.objectContaining(style))
+        // The footer is text alone: the desktop draws no image there
+        expect(await ui.find({ type: 'Svg' })).toBeUndefined()
         await ui.unmount()
       }
     }
     await clock.advance(1000)
-    await expectEach('●', '60m', 'warm')
+    await expectEach('● 60m', { dimColor: true })
     await clock.set(START + 50 * MIN)
-    await expectEach('◔', '10m', 'warn')
+    await expectEach('◔ 10m', { color: 'warning' })
     await clock.set(START + 59 * MIN + 18_000)
-    await expectEach('○', '0:42', 'warn')
+    await expectEach('○ 0:42', { color: 'warning' })
     await clock.set(START + 60 * MIN + 1000)
-    await expectEach('◌', 'Cold', 'cold')
+    await expectEach('◌ Cold', { dimColor: true })
   })
 
   test("the desktop's band draws the ring as an SVG image, amber in the last fifth, dashed with no arc once cold", async ($, on) => {
@@ -173,83 +132,20 @@ describe('cache-ttl-timer', () => {
     expect(cold).toContain('stroke-dasharray="1.6 2.1"')
   })
 
-  test("the terminal's footer keeps its labels when there are some, and the indicator stands alone when there are none", async ($, on) => {
+  test('keeps the footer labels when there are some, and stands alone when there are none', async ($, on) => {
     world(on)
     await start($)
     await step($)
-    const withModes = await footer($, 'terminal', ['focus'])
-    expect(await labelText(withModes)).toBe('60m')
-    expect(await withModes.find({ type: 'Text', text: /^ · $/ })).toBeDefined()
-    await withModes.unmount()
-    const alone = await footer($, 'terminal', [])
-    expect(await labelText(alone)).toBe('60m')
-    expect(await alone.find({ type: 'Text', text: /^ · $/ })).toBeUndefined()
-  })
-
-  test("the desktop draws the island above the prompt and leaves the footer's labels to Claude Code", async ($, on) => {
-    world(on)
-    await start($)
-    await step($)
-    const desktopBand = await band($, 'desktop')
-    expect(await labelText(desktopBand)).toBe('60m')
-    // The switch at the left, the ring and the time at the right
-    expect((await desktopBand.find({ type: 'Box' }))?.props.justifyContent).toBe('space-between')
-    // The desktop draws the footer's labels on a row of their own under the model and effort
-    const desktopFooter = await footer($, 'desktop', [])
-    expect(await label(desktopFooter)).toBeUndefined()
-    // The terminal's band stays Claude Code's: its indicator is in the footer
-    const terminalBand = await band($, 'terminal')
-    expect(await label(terminalBand)).toBeUndefined()
-    // A survey holds the band
-    const surveyBand = await band($, 'desktop', { hasSurvey: true })
-    expect(await label(surveyBand)).toBeUndefined()
-  })
-
-  test("the band's button turns idle compaction off and back on, dimming while off", async ($, on) => {
-    world(on)
-    await start($)
-    await step($)
-    const ui = await band($, 'desktop')
-    const button = () => ui.find({ type: 'Button' })
-    expect((await button())?.props).toEqual(expect.objectContaining({ key: 'idle-compaction', label: ON_LABEL }))
-    expect((await button())?.props.dimColor).toBeUndefined()
-    await ui.press({ key: 'idle-compaction' })
-    expect((await button())?.props).toEqual(expect.objectContaining({ label: OFF_LABEL, dimColor: true }))
-    await ui.press({ key: 'idle-compaction' })
-    expect((await button())?.props.label).toBe(ON_LABEL)
-  })
-
-  test('while off, an idle compaction is skipped; one inside a turn, right after a prompt, or by hand goes on', async ($, on) => {
-    const clock = world(on)
-    await start($)
-    await step($)
-    // On, the engine's idle compaction goes on
-    expect((await compact($, 'auto')).skip).toBeUndefined()
-    const ui = await band($, 'desktop')
-    await ui.press({ key: 'idle-compaction' })
-    // Off and idle: skipped
-    expect((await compact($, 'auto')).skip).toBe('Idle compaction is off for this session')
-    // The threshold's compaction inside a turn goes on
-    await $.turn.start({ text: 'go on', turnId: 't2' })
-    expect((await compact($, 'auto')).skip).toBeUndefined()
-    await $.turn.complete({ turnId: 't2', answer: '', durationMs: 1, isAborted: false, reason: 'answer' })
-    expect((await compact($, 'auto')).skip).toBe('Idle compaction is off for this session')
-    // A prompt just sent opens a turn whose turn.start may still be queued
-    await $.prompt.submit({ text: 'next', wait: false, origin: { kind: 'composer' } })
-    expect((await compact($, 'auto')).skip).toBeUndefined()
-    await clock.advance(3 * MIN)
-    expect((await compact($, 'auto')).skip).toBe('Idle compaction is off for this session')
-    // /compact is the person's own
-    expect((await compact($, 'manual')).skip).toBeUndefined()
-  })
-
-  test('the off choice is kept for the session across a resume', async ($, on) => {
-    world(on, '', { store: { 'idle-off:session-1': true } })
-    await start($)
-    await step($)
-    const ui = await band($, 'desktop')
-    expect((await ui.find({ type: 'Button' }))?.props.label).toBe(OFF_LABEL)
-    expect((await compact($, 'auto')).skip).toBe('Idle compaction is off for this session')
+    for (const surface of SURFACES) {
+      const withModes = await footer($, surface, ['focus'])
+      expect(await labelText(withModes)).toBe('60m')
+      expect(await withModes.find({ type: 'Text', text: /^ · $/ })).toBeDefined()
+      await withModes.unmount()
+      const alone = await footer($, surface, [])
+      expect(await labelText(alone)).toBe('60m')
+      expect(await alone.find({ type: 'Text', text: /^ · $/ })).toBeUndefined()
+      await alone.unmount()
+    }
   })
 
   test("a subagent's request doesn't restart the countdown", async ($, on) => {
@@ -258,7 +154,7 @@ describe('cache-ttl-timer', () => {
     await step($)
     await clock.advance(30 * MIN)
     await step($, 'agent-1')
-    const ui = await band($, 'desktop')
+    const ui = await footer($, 'desktop')
     expect(await labelText(ui)).toBe('30m')
     await step($)
     await clock.settle()
@@ -283,10 +179,10 @@ describe('cache-ttl-timer', () => {
     world(on, transcript)
     await start($)
     await $.classic.Stop({ stop_hook_active: false, transcript_path: '/t.jsonl' })
-    const ui = await band($, 'desktop')
+    const ui = await footer($, 'desktop')
     // The countdown starts when the request was sent, the prompt row's time, not the answer's
     expect(await labelText(ui)).toBe('5m')
-    const reply = await cacheTtl($, '')
+    const reply = await $.command.run({ command: 'cache-ttl', args: '' })
     expect(reply.text).toContain('TTL 5m (from the transcript)')
     expect(reply.text).toContain('drawn on desktop')
   })
@@ -295,30 +191,40 @@ describe('cache-ttl-timer', () => {
     world(on)
     await start($)
     await step($)
-    const ui = await band($, 'desktop')
-    await cacheTtl($, '5m')
+    const ui = await footer($, 'desktop')
+    await $.command.run({ command: 'cache-ttl', args: '5m' })
     expect(await labelText(ui)).toBe('5m')
-    await cacheTtl($, 'auto')
+    await $.command.run({ command: 'cache-ttl', args: 'auto' })
     expect(await labelText(ui)).toBe('60m')
-    const bad = await cacheTtl($, '2h')
+    const bad = await $.command.run({ command: 'cache-ttl', args: '2h' })
     expect(bad.text).toContain('Use /cache-ttl')
   })
 
-  test('a transcript too large to read falls back to what the session last kept', async ($, on) => {
-    world(on, '', { tooLarge: true, store: { 'last:session-1': { sentAt: START - 50 * MIN, ttl: '1h' } } })
-    await start($)
-    await $.classic.Stop({ stop_hook_active: false, transcript_path: '/t.jsonl' })
-    const ui = await footer($, 'terminal')
-    expect((await label(ui))?.text).toBe('◔ 10m')
-    const reply = await cacheTtl($, '')
-    expect(reply.text).toContain('TTL 1h (from the transcript)')
-  })
-
-  test('each request is kept for the next resume', async ($, on) => {
-    const kept = new Map<string, unknown>()
-    world(on, '', { tooLarge: true, kept })
+  test('a desktop that never asks for the footer gets the indicator above the prompt, at the right', async ($, on) => {
+    world(on)
     await start($)
     await step($)
-    expect(kept.get('last:session-1')).toEqual({ sentAt: START, ttl: null })
+    const desktopBand = await band($, 'desktop')
+    expect(await labelText(desktopBand)).toBe('60m')
+    expect((await desktopBand.find({ type: 'Box' }))?.props.justifyContent).toBe('flex-end')
+    // The terminal always draws the footer, so its band stays Claude Code's
+    const terminalBand = await band($, 'terminal')
+    expect(await label(terminalBand)).toBeUndefined()
+    // Once the desktop asks for the footer, the indicator moves there and the band empties
+    const foot = await footer($, 'desktop', [])
+    await desktopBand.redraw()
+    expect(await label(desktopBand)).toBeUndefined()
+    expect(await labelText(foot)).toBe('60m')
+  })
+
+  test('without `tail` (Windows) the countdown still runs, on the default TTL, and no hook fails', async ($, on) => {
+    world(on, '', { noTail: true })
+    await start($)
+    await $.classic.Stop({ stop_hook_active: false, transcript_path: '/t.jsonl' })
+    await step($)
+    const ui = await footer($, 'terminal')
+    expect((await label(ui))?.text).toBe('● 60m')
+    const reply = await $.command.run({ command: 'cache-ttl', args: '' })
+    expect(reply.text).toContain('TTL 1h (default)')
   })
 })

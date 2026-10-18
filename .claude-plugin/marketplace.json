@@ -4,7 +4,7 @@
     "name": "Seongje Hong",
     "url": "https://github.com/WQGGSEY"
   },
-  "description": "Cache TTL Timer: a prompt-cache countdown beside the Claude Code prompt",
+  "description": "Cache TTL Timer: a prompt-cache countdown for the Claude Code prompt footer",
   "plugins": [
     {
       "name": "cache-ttl-timer",
