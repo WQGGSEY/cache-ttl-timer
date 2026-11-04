@@ -55,14 +55,15 @@ To turn it off, disable the plugin in `/plugin`.
 Everything stays on your machine. The mod makes no network requests, calls no model, and doesn't change prompts, tool calls, or permissions. It only observes requests to time them.
 
 - **Hooks**: `session.start`, `classic.SessionStart`, `classic.Stop` and `turn.step` to follow requests; `command.run` for `/cache-ttl`; `ui.render` for the footer (`SessionMode`) and the band above the prompt (`AbovePrompt`).
-- **Files**: the current session's transcript, found under `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`) by the session's id. It reads the transcript's last 4 MB by running `tail -c 4000000 <transcript>`, and looks only at request timestamps and cache token counts. On a project path longer than 200 characters it lists `~/.claude/projects` to find the session's folder.
+- **Files**: the current session's transcript, found under `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`) by the session's id, read with `$.fs.read` when a session starts or resumes and when Claude stops answering. It looks only at request timestamps and cache token counts. `$.fs.read` refuses a file over 4 MiB; for a transcript that large the mod uses what it last kept for the session. On a project path longer than 200 characters it lists `~/.claude/projects` to find the session's folder.
 - **Environment**: `HOME` and `CLAUDE_CONFIG_DIR`, to find that folder.
-- **Storage**: the TTL you choose with `/cache-ttl 5m|1h`, in the plugin's own key-value store under `~/.claude/plugins/store/`; the last request time and the detected TTL, in the session's state.
+- **Programs it runs**: none.
+- **Storage**: the TTL you choose with `/cache-ttl 5m|1h`, and `last:<session id>` with each session's last request time and TTL, in the plugin's own key-value store under `~/.claude/plugins/store/`; the last request time and the detected TTL, in the session's state.
 - **Timer**: once a second it checks whether the label or the ring changed, and redraws only then: a few times a minute, and once a second in the last minute.
 
 ## Limitations
 
-- On Windows, where `tail` isn't available, the timer can't read the transcript. It still counts down from each request, on the 1-hour default; set the TTL with `/cache-ttl 5m` if your sessions use 5 minutes. A resumed session shows the timer only after its next request.
+- Once a transcript passes 4 MiB the mod can't read it, so the TTL stays the last one it read, and a session that was already that large before the mod first saw it shows the timer only after its next request, on the 1-hour default. Set the TTL with `/cache-ttl 5m` if your sessions use 5 minutes.
 - The transcript format isn't a public interface. If a release changes it, TTL detection falls back to the default.
 
 ## Development
