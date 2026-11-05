@@ -3,6 +3,8 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 const MIN = 60_000
 const START = Date.parse('2026-10-02T06:00:00Z')
 const SURFACES = ['desktop', 'terminal'] as const
+// Long enough for a new session's wait for its first TTL to run out
+const TTL_WAIT = 11_000
 const USAGE = {
   input_tokens: 10,
   output_tokens: 5,
@@ -14,7 +16,7 @@ const USAGE = {
 // What the world beneath the mod answers: no transcript on disk, no saved /cache-ttl choice
 function world(
   on: any,
-  transcript = '',
+  transcript: string | (() => string) = '',
   options: { tooLarge?: boolean; store?: Record<string, unknown>; kept?: Map<string, unknown> } = {},
 ) {
   const clock = mock.clock(on, { now: START })
@@ -38,6 +40,7 @@ function world(
   on('session.id', () => ({ value: 'session-1' }))
   on('session.surfaces', () => ({ value: ['desktop'] }))
   on('fs.exists', () => ({ value: false }))
+  on('classic.SessionStart', () => ({}))
   on('classic.Stop', () => ({}))
   on('session.usage', () => ({
     value: { startedAt: START, context: { tokens: 186_000, window: 1_000_000, percent: 18.6 }, rateLimits: [] },
@@ -47,7 +50,7 @@ function world(
   on('fs.read', () => {
     // A transcript over 4 MiB, which $.fs.read refuses
     if (options.tooLarge) throw new Error('EFBIG: file is over 4 MiB')
-    return { value: transcript }
+    return { value: typeof transcript === 'function' ? transcript() : transcript }
   })
   // The mod starts no program; a call here would fail where the program is missing, as tail is on Windows
   on('process.run', () => {
@@ -58,6 +61,22 @@ function world(
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: USAGE }
   })
   return clock
+}
+
+// A transcript holding one main-conversation request sent at START, which wrote the cache at the 5-minute TTL
+function fiveMinuteTranscript() {
+  return [
+    JSON.stringify({ type: 'user', timestamp: new Date(START).toISOString() }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: new Date(START + 20_000).toISOString(),
+      message: {
+        id: 'msg_1',
+        model: 'claude-opus-5-5',
+        usage: { ...USAGE, cache_creation: { ephemeral_5m_input_tokens: 100, ephemeral_1h_input_tokens: 0 } },
+      },
+    }),
+  ].join('\n')
 }
 
 async function start($: any) {
@@ -121,7 +140,7 @@ describe('cache-ttl-timer', () => {
         await ui.unmount()
       }
     }
-    await clock.advance(1000)
+    await clock.advance(TTL_WAIT)
     await expectEach('● 60m', { dimColor: true })
     await clock.set(START + 50 * MIN)
     await expectEach('◔ 10m', { color: 'warning' })
@@ -144,7 +163,7 @@ describe('cache-ttl-timer', () => {
       await ui.unmount()
       return source
     }
-    expect(await sourceAt(1000)).toContain('stroke="#9a9a9a"')
+    expect(await sourceAt(TTL_WAIT)).toContain('stroke="#9a9a9a"')
     expect(await sourceAt(50 * MIN)).toContain('stroke="#d99a2b"')
     const cold = await sourceAt(61 * MIN)
     expect(cold).not.toContain('#9a9a9a')
@@ -153,9 +172,10 @@ describe('cache-ttl-timer', () => {
   })
 
   test('keeps the footer labels when there are some, and stands alone when there are none', async ($, on) => {
-    world(on)
+    const clock = world(on)
     await start($)
     await step($)
+    await clock.advance(TTL_WAIT)
     for (const surface of SURFACES) {
       const withModes = await footer($, surface, ['focus'])
       expect(await labelText(withModes)).toBe('60m')
@@ -182,21 +202,7 @@ describe('cache-ttl-timer', () => {
   })
 
   test('reads the TTL from the transcript when Claude stops', async ($, on) => {
-    const sent = new Date(START).toISOString()
-    const transcript = [
-      'cut-off half line"}',
-      JSON.stringify({ type: 'user', timestamp: sent }),
-      JSON.stringify({
-        type: 'assistant',
-        timestamp: new Date(START + 20_000).toISOString(),
-        message: {
-          id: 'msg_1',
-          model: 'claude-opus-5-5',
-          usage: { ...USAGE, cache_creation: { ephemeral_5m_input_tokens: 100, ephemeral_1h_input_tokens: 0 } },
-        },
-      }),
-    ].join('\n')
-    world(on, transcript)
+    world(on, 'cut-off half line"}\n' + fiveMinuteTranscript())
     await start($)
     await $.classic.Stop({ stop_hook_active: false, transcript_path: '/t.jsonl' })
     const ui = await footer($, 'desktop')
@@ -207,23 +213,27 @@ describe('cache-ttl-timer', () => {
     expect(reply.text).toContain('drawn on desktop')
   })
 
-  test('/cache-ttl 5m overrides the TTL, and auto hands it back', async ($, on) => {
-    world(on)
+  test('/cache-ttl 5m overrides the TTL without waiting for the transcript, and auto hands it back', async ($, on) => {
+    const clock = world(on)
     await start($)
     await step($)
     const ui = await footer($, 'desktop')
     await $.command.run({ command: 'cache-ttl', args: '5m' })
     expect(await labelText(ui)).toBe('5m')
     await $.command.run({ command: 'cache-ttl', args: 'auto' })
+    // Back on the transcript, whose TTL the session is still waiting for
+    expect(await label(ui)).toBeUndefined()
+    await clock.advance(TTL_WAIT)
     expect(await labelText(ui)).toBe('60m')
     const bad = await $.command.run({ command: 'cache-ttl', args: '2h' })
     expect(bad.text).toContain('Use /cache-ttl')
   })
 
   test('a desktop that never asks for the footer gets the indicator above the prompt, at the right', async ($, on) => {
-    world(on)
+    const clock = world(on)
     await start($)
     await step($)
+    await clock.advance(TTL_WAIT)
     const desktopBand = await band($, 'desktop')
     expect(await labelText(desktopBand)).toBe('60m')
     expect((await desktopBand.find({ type: 'Box' }))?.props.justifyContent).toBe('flex-end')
@@ -235,6 +245,46 @@ describe('cache-ttl-timer', () => {
     await desktopBand.redraw()
     expect(await label(desktopBand)).toBeUndefined()
     expect(await labelText(foot)).toBe('60m')
+  })
+
+  test("a new session's first request reads the TTL as soon as its row lands, and shows nothing until then", async ($, on) => {
+    // The transcript is empty until the request's row is written, a second or so after the request
+    let transcript = ''
+    const clock = world(on, () => transcript)
+    await start($)
+    await $.classic.SessionStart({ source: 'startup', transcript_path: '/t.jsonl' })
+    await step($)
+    const ui = await footer($, 'terminal')
+    // Not the 1h default on what may be a 5-minute cache
+    expect(await label(ui)).toBeUndefined()
+    const waiting = await $.command.run({ command: 'cache-ttl', args: '' })
+    expect(waiting.text).toContain('TTL not known yet')
+    await clock.advance(1000)
+    expect(await label(ui)).toBeUndefined()
+    transcript = fiveMinuteTranscript()
+    await clock.advance(1000)
+    // Well before the turn ends and classic.Stop reads the transcript
+    expect(await labelText(ui)).toBe('5m')
+    const reply = await $.command.run({ command: 'cache-ttl', args: '' })
+    expect(reply.text).toContain('TTL 5m (from the transcript)')
+  })
+
+  test('with no TTL in the transcript the wait gives up on the 1h default, and runs only once per session', async ($, on) => {
+    const clock = world(on)
+    await start($)
+    await step($)
+    const ui = await footer($, 'desktop')
+    await clock.advance(5000)
+    expect(await label(ui)).toBeUndefined()
+    await clock.advance(TTL_WAIT - 5000)
+    expect(await labelText(ui)).toBe('60m')
+    const reply = await $.command.run({ command: 'cache-ttl', args: '' })
+    expect(reply.text).toContain('TTL 1h (default)')
+    // A later request shows the countdown straight away
+    await clock.advance(50 * MIN)
+    await step($)
+    await clock.settle()
+    expect(await labelText(ui)).toBe('60m')
   })
 
   test('a transcript too large to read falls back to what the session last kept', async ($, on) => {
