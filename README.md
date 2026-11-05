@@ -22,7 +22,7 @@ Nothing shows before the first request of a session. The label uses the footer's
 ## How it works
 
 - **When the countdown starts**: each time the main conversation sends a request to the model, which is when the cache is read or written. A turn with tool calls sends several requests, and each one restarts the countdown. Requests from subagents are left out, because they cache their own prompts.
-- **Which TTL applies**: read from the session's transcript, where the API reports how many tokens each request wrote to the cache at the 5-minute and 1-hour TTL. Until a write is seen, the timer assumes 1 hour, the TTL Claude Code uses on the main conversation of a subscription.
+- **Which TTL applies**: read from the session's transcript, where the API reports how many tokens each request wrote to the cache at the 5-minute and 1-hour TTL. In a new session the first request's write reaches the transcript about a second after the request, so the timer shows nothing until it's read, for up to 10 seconds, rather than guess. If no write turns up by then, the timer assumes 1 hour, the TTL Claude Code uses on the main conversation of a subscription.
 - **After a restart or a resume**: the countdown picks up from the last request in the transcript, so a session you come back to shows whether its cache is still warm before you type.
 
 The timer is an estimate from the client's side. The service can drop a cache entry early, so treat `Cold` as certain and the time left as an upper bound.
@@ -55,11 +55,11 @@ To turn it off, disable the plugin in `/plugin`.
 Everything stays on your machine. The mod makes no network requests, calls no model, and doesn't change prompts, tool calls, or permissions. It only observes requests to time them.
 
 - **Hooks**: `session.start`, `classic.SessionStart`, `classic.Stop` and `turn.step` to follow requests; `command.run` for `/cache-ttl`; `ui.render` for the footer (`SessionMode`) and the band above the prompt (`AbovePrompt`).
-- **Files**: the current session's transcript, found under `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`) by the session's id, read with `$.fs.read` when a session starts or resumes and when Claude stops answering. It looks only at request timestamps and cache token counts. `$.fs.read` refuses a file over 4 MiB; for a transcript that large the mod uses what it last kept for the session. On a project path longer than 200 characters it lists `~/.claude/projects` to find the session's folder.
+- **Files**: the current session's transcript, found under `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`) by the session's id, read with `$.fs.read` when a session starts or resumes, when Claude stops answering, and in a new session once a second for up to 10 seconds after its first request, until the TTL is found. It looks only at request timestamps and cache token counts. `$.fs.read` refuses a file over 4 MiB; for a transcript that large the mod uses what it last kept for the session. On a project path longer than 200 characters it lists `~/.claude/projects` to find the session's folder.
 - **Environment**: `HOME` and `CLAUDE_CONFIG_DIR`, to find that folder.
 - **Programs it runs**: none.
 - **Storage**: the TTL you choose with `/cache-ttl 5m|1h`, and `last:<session id>` with each session's last request time and TTL, in the plugin's own key-value store under `~/.claude/plugins/store/`; the last request time and the detected TTL, in the session's state.
-- **Timer**: once a second it checks whether the label or the ring changed, and redraws only then: a few times a minute, and once a second in the last minute.
+- **Timer**: once a second it checks whether the label or the ring changed, and redraws only then: a few times a minute, and once a second in the last minute. The same timer reads the transcript during a new session's first 10 seconds while the TTL isn't known yet.
 
 ## Limitations
 

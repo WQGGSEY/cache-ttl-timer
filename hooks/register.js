@@ -11,10 +11,17 @@ import { atom, read, update } from 'claude-code'
 const lastHit = atom({ plugin: 'cache-ttl-timer', key: 'lastHit' }, null)
 // The TTL the latest cache write used, as the transcript reports it; null until one is seen
 const detectedTtl = atom({ plugin: 'cache-ttl-timer', key: 'detectedTtl' }, null)
+// The wait for a new session's first TTL: null before it, the $.clock.now() deadline while it runs, 'done' after
+const ttlWait = atom({ plugin: 'cache-ttl-timer', key: 'ttlWait' }, null)
+// The transcript's path, as classic.SessionStart gives it; null until then
+const transcriptFile = atom({ plugin: 'cache-ttl-timer', key: 'transcriptFile' }, null)
 
 const TTL_MS = { '5m': 5 * 60 * 1000, '1h': 60 * 60 * 1000 }
 // What Claude Code asks for on the main thread of a subscription that isn't in overage
 const DEFAULT_TTL = '1h'
+// How long a new session's first request waits for its row in the transcript, which says the TTL.
+// The row usually lands about a second after the request ends; the ticker reads once a second meanwhile.
+const TTL_WAIT_MS = 10 * 1000
 // The share of the TTL left when the countdown turns amber
 const WARN_FRACTION = 0.2
 // Claude Code names a project's folder after its path, cut to this length
@@ -38,6 +45,8 @@ let override = null
 let drawnKey = ''
 // Whether the desktop has asked for the footer's mode labels; until it does, the band above the prompt stands in
 let desktopFooterSeen = false
+// Whether the ticker is reading the transcript, so a slow read isn't started again on the next tick
+let ttlReading = false
 
 export function register(on) {
   // Runs before the first prompt, and again after a reload
@@ -62,6 +71,7 @@ export function register(on) {
 
   // Runs on startup, /resume, /clear and compaction, with the transcript's path
   on('classic.SessionStart', async ($, e, next) => {
+    if (e.transcript_path) await update($, transcriptFile, () => e.transcript_path)
     await learnFromTranscript($, e.transcript_path)
     return next(e)
   })
@@ -82,6 +92,12 @@ export function register(on) {
     if (result.usage) {
       await update($, lastHit, (prev) => Math.max(prev ?? 0, sentAt))
       await remember($)
+      // A new session doesn't know its TTL until this request's row reaches the transcript, which
+      // classic.Stop would read only at the end of the turn. Have the ticker look for it now, once.
+      if ((await read($, detectedTtl)) === null && (await read($, ttlWait)) === null) {
+        const until = (await $.clock.now()) + TTL_WAIT_MS
+        await update($, ttlWait, () => until)
+      }
     }
     return result
   })
@@ -156,6 +172,8 @@ async function drawIndicator($, e, now) {
 async function readout($) {
   const hit = await read($, lastHit)
   if (hit === null) return null
+  // Draw nothing rather than the default while the first TTL is on its way
+  if (await waitingForTtl($)) return null
   const ttl = await ttlFor($)
   const total = TTL_MS[ttl]
   const left = hit + total - (await $.clock.now())
@@ -201,8 +219,15 @@ async function ttlFor($) {
   return override ?? (await read($, detectedTtl)) ?? DEFAULT_TTL
 }
 
-// Once a second: redraw when the label or the ring has changed
+// Whether the TTL is still unknown and a new session's first request is waiting to read it
+async function waitingForTtl($) {
+  if (override) return false
+  return typeof (await read($, ttlWait)) === 'number' && (await read($, detectedTtl)) === null
+}
+
+// Once a second: look for the first TTL while a new session waits for it, then redraw when the label or the ring has changed
 async function tick($) {
+  await awaitTtl($)
   const now = await readout($)
   const key = now ? now.level + now.label + now.step : ''
   if (key === drawnKey) return
@@ -210,14 +235,33 @@ async function tick($) {
   $.ui.invalidate('ui.render')
 }
 
+// Reads the transcript for the TTL during a new session's wait, and ends the wait once it's found or the deadline passes
+async function awaitTtl($) {
+  const until = await read($, ttlWait)
+  if (typeof until !== 'number' || ttlReading) return
+  ttlReading = true
+  try {
+    if ((await read($, detectedTtl)) === null) {
+      const path = (await read($, transcriptFile)) ?? (await transcriptPath($))
+      if (path) await learnFromTranscript($, path)
+    }
+  } catch {
+    // Not there yet; the next tick tries again until the deadline
+  } finally {
+    ttlReading = false
+  }
+  if ((await read($, detectedTtl)) !== null || (await $.clock.now()) >= until) await update($, ttlWait, () => 'done')
+}
+
 // The reply to /cache-ttl
 async function statusText($) {
+  if (await waitingForTtl($)) {
+    return 'TTL not known yet: reading it from the transcript, using 1h if it isn\'t there in a few seconds · ' + (await drawnText($))
+  }
   const ttl = await ttlFor($)
   const source = override ? 'set with /cache-ttl' : (await read($, detectedTtl)) ? 'from the transcript' : 'default'
   const head = 'TTL ' + ttl + ' (' + source + ')'
-  // Where the indicator can show: an app draws a mod's UI only once it attaches to the session
-  const surfaces = await $.session.surfaces()
-  const drawn = surfaces.length > 0 ? 'drawn on ' + surfaces.join(', ') : 'no app draws mod UI in this session'
+  const drawn = await drawnText($)
   const hit = await read($, lastHit)
   if (hit === null) return head + ' · no request yet · ' + drawn
   const now = await $.clock.now()
@@ -225,6 +269,12 @@ async function statusText($) {
   const ago = 'last request ' + clockText(now - hit) + ' ago'
   const state = left > 0 ? clockText(left) + ' left' : 'expired, the next message writes the cache again'
   return head + ' · ' + ago + ' · ' + state + ' · ' + drawn
+}
+
+// Where the indicator can show: an app draws a mod's UI only once it attaches to the session
+async function drawnText($) {
+  const surfaces = await $.session.surfaces()
+  return surfaces.length > 0 ? 'drawn on ' + surfaces.join(', ') : 'no app draws mod UI in this session'
 }
 
 // Reads the transcript and records the TTL of the latest cache write, and the last request if it's newer.
